@@ -10,39 +10,57 @@ import claripy_searchmc
 import interpret
 
 if len(sys.argv) < 3:
-    print("Usage: python analyze.py binary rounds [-v]")
-
-p = angr.Project(sys.argv[1], exclude_sim_procedures_list=['srand', 'rand'])
-rounds = int(sys.argv[2])
+    print("Usage: python analyze.py binary rounds [-v] [-- arguments]")
 
 if '-v' in sys.argv:
     logging.getLogger('angr.engines.engine').setLevel("INFO")
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel('ERROR')
 
-class SymbolicPid(angr.SimProcedure):
-    def run(self): # pylint: disable=arguments-differ
-        pid = self.state.solver.BVS('pid', 15, key=('entropy', 'getpid')).zero_extend(64-15)
-        self.state.solver.add(pid == random.randrange(0, 2**15))
-        return pid
-
 class TrueRand(angr.SimProcedure):
-    def run(self): # pylint: disable=arguments-differ
-        val = self.state.solver.BVS('true_random', 32, key=('entropy', 'true_rand')).zero_extend(64-32)
-        self.state.solver.add(val == random.randrange(0, 2**32))
-        return val
+    def run(self, name=None, bits=None, reuse=True): # pylint: disable=arguments-differ
+        key = ('entropy', name)
+        if key in self.state.globals:
+            val = self.state.globals[key]
+        else:
+            val = self.state.solver.BVS(name, bits, key=('entropy', name))
+            self.state.solver.add(val == random.randrange(0, 2**bits))
 
-p.hook_symbol('getpid', SymbolicPid())
-p.hook_symbol('true_rand', TrueRand())
+            if reuse:
+                self.state.globals[key] = val
 
-def single_path():
-    simgr = p.factory.simulation_manager()
-    simgr.run()
+        return val.zero_extend(self.arch.bits-bits)
+
+def load_project():
+    p = angr.Project(sys.argv[1], exclude_sim_procedures_list=['srand', 'rand', 'memset', 'malloc', 'free', 'realloc', 'bzero', 'memcpy', 'strlen', 'strcpy', 'strncpy', 'strcmp', 'strncmp'])
+
+    p.hook_symbol('getpid', TrueRand(name='getpid', bits=15))
+    p.hook_symbol('true_rand', TrueRand(name='true_rand', bits=32))
+    return p
+
+def single_path(p):
+    try:
+        args = [sys.argv[1]] + sys.argv[sys.argv.index('--')+1:]
+    except ValueError:
+        args = [sys.argv[1]]
+
+    initial_state = p.factory.full_init_state(args=args, add_options=angr.options.unicorn | {angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY}, remove_options={angr.options.ALL_FILES_EXIST}, concrete_fs=True)
+    simgr = p.factory.simulation_manager(initial_state)
+    simgr.run(until=lambda lsm: len(lsm.active) != 1)
 
     if not simgr.deadended:
         print("OH NO: couldn't find a deadended state")
-        print("Errored states:")
-        for e in simgr.errored:
-            print(e)
+        if simgr.errored:
+            print("Errored states:")
+            for e in simgr.errored:
+                print(e)
+        elif simgr.active:
+            print("Active states:")
+            for s in simgr.active:
+                print(s)
+        else:
+            print("Unknown result??????")
+            print(simgr)
+        import ipdb; ipdb.set_trace()
         sys.exit(1)
 
     state = simgr.deadended[0]
@@ -71,19 +89,24 @@ def analyze_searchmc(content):
 
     return low, high
 
-data = []
-for i in range(1, rounds + 1):
-    output = single_path()
-    bits = analyze_mine(output)
-    datum = interpret.compute_final(bits)
-    data.append(datum)
+def main():
+    p = load_project()
+    rounds = int(sys.argv[2])
+    data = []
+    for i in range(1, rounds + 1):
+        output = single_path(p)
+        bits_desc = analyze_mine(output)
+        bits_num = interpret.compute_final(bits_desc)
+        data.append(bits_num)
 
-    #xbits_low, xbits_high = analyze_searchmc(output)
-    print('Round %d/%d:' % (i, rounds), datum, 'bits of entropy')
-    #print('searchmc:', xbits_low, xbits_high)
+        #xbits_low, xbits_high = analyze_searchmc(output)
+        print('Round %d/%d:' % (i, rounds), bits_num, 'bits of entropy')
+        #print('searchmc:', xbits_low, xbits_high)
 
-print('')
-print(sys.argv[1])
-print('min entropy:', min(data), 'bits')
-print('max entropy:', max(data), 'bits')
-print('')
+    print('')
+    print(sys.argv[1])
+    print('min entropy:', min(data), 'bits')
+    print('max entropy:', max(data), 'bits')
+    print('')
+
+main()
