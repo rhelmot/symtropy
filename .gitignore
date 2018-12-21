@@ -1,0 +1,6 @@
+program01
+program02
+program03
+*.pyc
+temp_files/
+SearchMC/
