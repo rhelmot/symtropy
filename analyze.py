@@ -9,11 +9,15 @@ import random
 import claripy_searchmc
 import interpret
 
+l = logging.getLogger('symtropy.analyze')
+
 if len(sys.argv) < 3:
     print("Usage: python analyze.py binary rounds [-v] [-- arguments]")
 
+logging.getLogger('symtropy').setLevel('WARNING')
 if '-v' in sys.argv:
     logging.getLogger('angr.engines.engine').setLevel("INFO")
+    logging.getLogger('symtropy').setLevel('INFO')
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel('ERROR')
 
 class TrueRand(angr.SimProcedure):
@@ -22,7 +26,7 @@ class TrueRand(angr.SimProcedure):
         if key in self.state.globals:
             val = self.state.globals[key]
         else:
-            val = self.state.solver.BVS(name, bits, key=('entropy', name))
+            val = self.state.solver.BVS(name, bits, key=key)
             self.state.solver.add(val == random.randrange(0, 2**bits))
 
             if reuse:
@@ -34,7 +38,7 @@ def load_project():
     p = angr.Project(sys.argv[1], exclude_sim_procedures_list=['srand', 'rand', 'memset', 'malloc', 'free', 'realloc', 'bzero', 'memcpy', 'strlen', 'strcpy', 'strncpy', 'strcmp', 'strncmp'])
 
     p.hook_symbol('getpid', TrueRand(name='getpid', bits=15))
-    p.hook_symbol('true_rand', TrueRand(name='true_rand', bits=32))
+    p.hook_symbol('true_rand', TrueRand(name='true_rand', bits=32, reuse=False))
     return p
 
 def single_path(p):
@@ -66,11 +70,12 @@ def single_path(p):
     state = simgr.deadended[0]
 
     content = state.solver.Concat(*[entry[0] for entry in state.posix.stdout.content])
+    l.info("Single-path finished")
     return content
 
 def analyze_mine(content):
     bitmap = interpret.interpret(content)
-    allbits = interpret.mix_bits(bitmap)
+    allbits = interpret.mix_bits(interpret.convert_to_bools(interpret.bake_masks(bitmap)))
     collapsed = interpret.simplify(allbits)
     return collapsed
 

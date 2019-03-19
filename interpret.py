@@ -1,16 +1,22 @@
 import claripy
 from functools import reduce
-from collections import defaultdict
+from collections import defaultdict, Counter
+import information
+import logging
 
-cache = {}
+l = logging.getLogger('symtropy.interpret')
+
+cache = {} # translation cache
 
 def interpret(ast):
     """
     Find the bits that are present in the ast. Will return a list where each entry corresponds
     to the corresponding bit of the AST. Entries can be booleans, indicating a concrete value,
-    or a set of bool-valued ASTs indicating bits. The ASTs can be either actual bool
-    comparisons in the ASTs or comparisons of the form var[bit] == 1, indicating the presence
-    of the given bit in the output.
+    or a set of bits. The bits will be tuples of (AST, bit index).
+    itself.
+
+    Note: pretty much everything but the input ast will actually be a cache key. you have been
+    warned.
     """
     if not isinstance(ast, claripy.ast.Base):
         import ipdb; ipdb.set_trace()
@@ -18,7 +24,10 @@ def interpret(ast):
     if ast.cache_key in cache:
         return cache[ast.cache_key]
     else:
-        val = _interpret(ast)
+        raw_val = _interpret(ast)
+        #val = raw_val
+        val = manage_mix_masks(ast, raw_val)
+
         cache[ast.cache_key] = val
         return val
 
@@ -26,13 +35,11 @@ def _interpret(ast):
     if ast.op == 'BVV':
         return [bool((ast.args[0] >> i) & 1) for i in range(len(ast))]
     if ast.op == 'BVS':
-        return [{(ast[i] == 1).cache_key} for i in range(len(ast))]
+        return [{(ast.cache_key, i)} for i in range(len(ast))]
     if ast.op == 'BoolV':
         return [ast.args[0]]
-    if type(ast) == claripy.ast.bool.Bool:
-        return [{ast.cache_key}]
-    if ast.op == '__invert__':
-        return [~val if type(val) is bool else val for val in interpret(ast.args[0])]
+    if ast.op == 'BoolS':
+        return [{(ast.cache_key, 0)}]
     if ast.op == '__neg__':
         return interpret(~ast.args[0] + 1)
     if ast.op == '__sub__':
@@ -41,8 +48,12 @@ def _interpret(ast):
     if ast.op == 'Extract':
         return [val for i, val in enumerate(interpret(ast.args[2])) if ast.args[1] <= i <= ast.args[0]]
 
-
     children = [interpret(child) for child in ast.args]
+
+    if type(ast) == claripy.ast.bool.Bool:
+        return [mix_all_bits(children)]
+    if ast.op == '__invert__':
+        return [~val if type(val) is bool else val for val in children]
     if ast.op in ('__and__', '__or__', '__xor__'):
         out = children[0]
         midout = []
@@ -135,7 +146,8 @@ def _interpret(ast):
 
         if (ast.args[1] != 1 << top_bit).is_true():
             top_bit += 1
-            bits += [{(ast.args[0] % (1 << top_bit) > ast.args[1]).cache_key}]
+            have_bits += 1
+            bits += [{((ast.args[0] % (1 << top_bit) > ast.args[1]).cache_key, 0)}]
 
         bit = mix_bits(bits)
 
@@ -205,22 +217,121 @@ def _interpret(ast):
 
 complained = set()
 
+# mix masks are internal nodes to the AST where we have identified that there are more bits of input than output
+mix_masks = {} # map from mixmask to (original translation, root bits, height) where height is the max height of all its masked bits + 1
+
+def classify_bits(bits):
+    masks = set()
+    free_bits = set()
+
+    if type(bits) is bool:
+        return masks, free_bits
+
+    for bit in bits:
+        mask = bit[0]
+        if mask in mix_masks:
+            masks.add(mask)
+        else:
+            free_bits.add(bit)
+
+    return masks, free_bits
+
+def unmask(bits, mask):
+    if type(bits) is bool:
+        return bits
+
+    result = set()
+    for bit in bits:
+        mmask, i = bit
+        if mmask == mask:
+            result.update(mix_masks[mask][0][i])
+        else:
+            result.add(bit)
+    return result
+
+def manage_mix_masks(ast, val):
+    # check: do we have interdependent mix masks?
+    masks, free_bits = classify_bits(mix_bits(val))
+
+    counts = Counter()
+    for mask in masks:
+        counts.update(mix_masks[mask][1])
+
+    # remove masks (in order of recency) until there are no more conflicts
+    while True:
+        conflicts = [bit for bit, count in counts.items() if count > 1 or (count > 0 and bit in free_bits)]
+        if not conflicts:
+            break
+
+        try:
+            removeme = max((m for m in masks if mix_masks[m][1].intersection(conflicts)), key=lambda m: mix_masks[m][2])
+        except ValueError:
+            import ipdb; ipdb.set_trace()
+
+        if removeme.ast.op == 'SMod':
+            import ipdb; ipdb.set_trace()
+        masks.remove(removeme)
+        counts.subtract(mix_masks[removeme][1])
+        val = [unmask(bits, removeme) for bits in val]
+        new_masks, new_free_bits = classify_bits(mix_bits(mix_masks[removeme][0]))
+        for mask in new_masks:
+            if mask not in masks:
+                masks.add(mask)
+                counts.update(mix_masks[mask][1])
+        free_bits.update(new_free_bits)
+
+    # check: should we mix mask now?
+    max_bits = len([x for x in val if type(x) is not bool])
+    mixed = mix_bits(val)
+
+    if len(mixed) > max_bits:
+        # it's time for a MIX MASK
+        oldval = val
+        if type(ast) is claripy.ast.Bool:
+            newval = [{(ast.cache_key, 0)}]
+        else:
+            newval = [{(ast.cache_key, i)} if type(oldval[i]) is not bool else oldval[i] for i in range(len(ast))]
+        val = newval
+
+        max_height = 0
+        roots = set()
+        for bit in mixed:
+            mask = bit[0]
+            if mask in mix_masks:
+                info = mix_masks[mask]
+                max_height = max(info[2], max_height)
+                roots.update(info[1])
+            else:
+                roots.add(bit)
+
+        mix_masks[ast.cache_key] = (oldval, roots, max_height + 1)
+
+    return val
+
+
 def mix_bits(bits):
     """
-    Given a list of bit result values (valid entries-in-lists as output by analyze()), mix all
+    Given a list of bit result values (valid entries-in-lists as output by interpret()), mix all
     the taints together.
     """
     return set().union(*(bit for bit in bits if type(bit) is not bool))
 
 def mix_all_bits(children):
     """
-    Given a list of results from analyze(), mix all the taints together.
+    Given a list of results from interpret(), mix all the taints together.
     """
     return set().union(*(mix_bits(child) for child in children))
 
+def bake_masks(in_bits):
+    replacements = {mask: claripy.BVS('mask', len(mask.ast)) for mask in mix_masks if type(mask.ast) is not claripy.ast.Bool}
+    return [bit if type(bit) is bool else {(mask.ast.replace_dict(replacements).cache_key, i) for mask, i in bit} for bit in in_bits]
+
+def convert_to_bools(in_bits):
+    return [bit if type(bit) is bool else {mask if type(mask.ast) is claripy.ast.Bool else (mask.ast[i] == 1).cache_key for mask, i in bit} for bit in in_bits]
+
 def simplify(in_bits):
     """
-    Given a bit result value (valid entries-in-lists as output by analyze()), simplify the
+    Given a bit result value (valid entries-in-lists as output by interpret()), simplify the
     result to remove bits which are implied by other bits.
     """
     partitions = defaultdict(list)
@@ -281,14 +392,19 @@ def simplify(in_bits):
     return out
 
 def compute_final(in_bits):
+    entropy = information.H1([x.ast for x in in_bits if type(x) is not bool])
+
     all_vars = set()
     for bitkey in in_bits:
         if type(bitkey) is bool:
             continue
         all_vars.update(bitkey.ast.variables)
-    total_bits = 0
+    sanity_check = 0
     for var in all_vars:
-        total_bits += int(var.split('_')[-1])
+        sanity_check += int(var.split('_')[-1])
 
-    # SANITY CHECK IS ABOUT ALL WE GOT RIGHT NOW
-    return min(total_bits, len(in_bits))
+    if sanity_check < entropy:
+        l.warning('Sanity check failure: computed %s but only %s available. falling back', entropy, sanity_check)
+        return sanity_check
+
+    return entropy

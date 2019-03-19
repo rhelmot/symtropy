@@ -26,12 +26,14 @@ void hexputc(unsigned char val) {
 
 int A = 100; // force gcc to not implement const div with mul
 int B = 99;
+//#define A 100
+//#define B 99
 
 int main() {
     int (*myrand)(void);
     int val = true_rand();
-    if (val % A == 0) {
-        srand(val % B);
+    if (val % A == 0 || 1) {
+        srand(val / A % B);
         myrand = &rand;
     } else {
         myrand = &true_rand;
