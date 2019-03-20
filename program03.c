@@ -32,7 +32,7 @@ int B = 99;
 int main() {
     int (*myrand)(void);
     int val = true_rand();
-    if (val % A == 0 || 1) {
+    if (val % A == 0) {
         srand(val / A % B);
         myrand = &rand;
     } else {
